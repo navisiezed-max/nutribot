@@ -29,6 +29,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8736413039:AAH7Snz2mGy9heZ9GwbMScoJicOwNPlUVsE")
 DB_PATH   = "nutrition_bot.db"
+OWNER_ID  = int(os.getenv("OWNER_ID", "0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -61,7 +62,23 @@ def init_db() -> None:
                 fat           REAL,
                 carbs         REAL,
                 subscribed    INTEGER DEFAULT 0,
+                reminders     INTEGER DEFAULT 0,
                 created_at    TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS weight_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                weight     REAL NOT NULL,
+                logged_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS coaching_clicks (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                clicked_at TEXT DEFAULT (datetime('now'))
             )
         """)
         conn.commit()
@@ -102,6 +119,61 @@ def set_subscribed(user_id: int) -> None:
     with db_conn() as conn:
         conn.execute("UPDATE users SET subscribed=1 WHERE user_id=?", (user_id,))
         conn.commit()
+
+
+def log_weight(user_id: int, weight: float) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO weight_log (user_id, weight) VALUES (?, ?)",
+            (user_id, weight),
+        )
+        conn.commit()
+
+
+def get_weight_log(user_id: int, limit: int = 7) -> list:
+    with db_conn() as conn:
+        return conn.execute(
+            "SELECT weight, logged_at FROM weight_log WHERE user_id=? "
+            "ORDER BY logged_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+
+
+def log_coaching_click(user_id: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO coaching_clicks (user_id) VALUES (?)", (user_id,)
+        )
+        conn.commit()
+
+
+def get_coaching_stats() -> dict:
+    with db_conn() as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_clicks = conn.execute("SELECT COUNT(*) FROM coaching_clicks").fetchone()[0]
+        unique_clickers = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM coaching_clicks"
+        ).fetchone()[0]
+        clicks_7d = conn.execute(
+            "SELECT COUNT(*) FROM coaching_clicks "
+            "WHERE clicked_at >= datetime('now', '-7 days')"
+        ).fetchone()[0]
+        clicks_30d = conn.execute(
+            "SELECT COUNT(*) FROM coaching_clicks "
+            "WHERE clicked_at >= datetime('now', '-30 days')"
+        ).fetchone()[0]
+        new_users_7d = conn.execute(
+            "SELECT COUNT(*) FROM users "
+            "WHERE created_at >= datetime('now', '-7 days')"
+        ).fetchone()[0]
+    return {
+        "total_users": total_users,
+        "total_clicks": total_clicks,
+        "unique_clickers": unique_clickers,
+        "clicks_7d": clicks_7d,
+        "clicks_30d": clicks_30d,
+        "new_users_7d": new_users_7d,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -276,8 +348,9 @@ def kb_result() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🍽 Показать меню на день",   callback_data="show_menu")],
         [InlineKeyboardButton(text="📖 Как использовать КБЖУ",  callback_data="show_tips")],
-        [InlineKeyboardButton(text="🤝 Работа со мной",          callback_data="coaching")],
+        [InlineKeyboardButton(text="📊 Записать вес",            callback_data="log_weight")],
         [InlineKeyboardButton(text="🔄 Пересчитать",            callback_data="restart")],
+        [InlineKeyboardButton(text="🤝 Работа со мной",          callback_data="coaching")],
     ])
 
 
@@ -306,6 +379,10 @@ class Form(StatesGroup):
     goal     = State()
 
 
+class WeightCheck(StatesGroup):
+    weight = State()
+
+
 # ─────────────────────────────────────────────
 # 🤖  ХЭНДЛЕРЫ
 # ─────────────────────────────────────────────
@@ -321,6 +398,7 @@ async def cmd_start(msg: Message, state: FSMContext) -> None:
     await msg.answer(
         f"👋 Привет, <b>{name}</b>!\n\n"
         "Я рассчитаю твои индивидуальные <b>КБЖУ</b> (калории, белки, жиры, углеводы) "
+        "по формуле <b>Харриса-Бенедикта</b> и составлю пример меню.\n\n"
         "Это займёт ~1 минуту. Начнём? 🚀\n\n"
         "❓ <b>Сколько тебе лет?</b> (введи число, например: <code>28</code>)",
         parse_mode=ParseMode.HTML,
@@ -550,6 +628,7 @@ async def cb_show_tips(call: CallbackQuery) -> None:
 # ── Кнопка: работа со мной ───────────────────────────────
 @dp.callback_query(F.data.in_({"coaching", "subscribe"}))
 async def cb_coaching(call: CallbackQuery) -> None:
+    log_coaching_click(call.from_user.id)
     text = (
         "🤝 <b>Персональное сопровождение</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -651,9 +730,153 @@ async def cmd_profile(msg: Message) -> None:
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Мой прогресс",      callback_data="show_progress")],
             [InlineKeyboardButton(text="🔄 Пересчитать КБЖУ", callback_data="restart")],
             [InlineKeyboardButton(text="🤝 Работа со мной",   callback_data="coaching")],
         ]),
+    )
+
+
+# ── Записать вес (кнопка или /weight) ────────────────────
+@dp.callback_query(F.data == "log_weight")
+async def cb_log_weight(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.answer(
+        "📊 <b>Запись веса</b>\n\n"
+        "Введи текущий вес в кг (например: <code>83.5</code>):",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(WeightCheck.weight)
+
+
+@dp.message(Command("weight"))
+async def cmd_weight(msg: Message, state: FSMContext) -> None:
+    await msg.answer(
+        "📊 <b>Запись веса</b>\n\n"
+        "Введи текущий вес в кг (например: <code>83.5</code>):",
+        parse_mode=ParseMode.HTML,
+    )
+    await state.set_state(WeightCheck.weight)
+
+
+@dp.message(WeightCheck.weight)
+async def process_weight_check(msg: Message, state: FSMContext) -> None:
+    try:
+        weight = float(msg.text.strip().replace(",", "."))
+        assert 30 <= weight <= 300
+    except (ValueError, AssertionError):
+        await msg.answer("⚠️ Введи корректный вес от 30 до 300 кг.")
+        return
+
+    await state.clear()
+    log_weight(msg.from_user.id, weight)
+
+    logs = get_weight_log(msg.from_user.id, limit=7)
+    user = get_user(msg.from_user.id)
+
+    # Сравниваем с предыдущей записью
+    if len(logs) >= 2:
+        prev = logs[1]["weight"]
+        diff = round(weight - prev, 1)
+        arrow = "📈" if diff > 0 else ("📉" if diff < 0 else "➡️")
+        diff_str = f"{'+' if diff > 0 else ''}{diff} кг"
+        change_line = f"{arrow} С прошлого раза: <b>{diff_str}</b>\n"
+    else:
+        change_line = "📌 Первая запись — будем отслеживать динамику!\n"
+
+    # Рекомендация пересчитать КБЖУ
+    recalc_hint = ""
+    if user and user["weight"]:
+        total_diff = round(weight - user["weight"], 1)
+        if abs(total_diff) >= 3:
+            recalc_hint = (
+                f"\n⚡️ Вес изменился на <b>{'+' if total_diff > 0 else ''}{total_diff} кг</b> "
+                "от последнего расчёта.\n<b>Рекомендуем пересчитать КБЖУ!</b>"
+            )
+
+    await msg.answer(
+        f"✅ Вес <b>{weight} кг</b> сохранён!\n\n"
+        f"{change_line}"
+        f"{recalc_hint}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📈 Посмотреть прогресс", callback_data="show_progress")],
+            [InlineKeyboardButton(text="🔄 Пересчитать КБЖУ",   callback_data="restart")],
+        ]),
+    )
+
+
+# ── Показать прогресс ─────────────────────────────────────
+@dp.callback_query(F.data == "show_progress")
+async def cb_show_progress(call: CallbackQuery) -> None:
+    logs = get_weight_log(call.from_user.id, limit=7)
+    if not logs:
+        await call.answer("Нет записей. Нажми «📊 Записать вес».", show_alert=True)
+        return
+
+    lines = []
+    for i, row in enumerate(reversed(logs)):
+        date = row["logged_at"][:10]
+        w = row["weight"]
+        if i == 0:
+            lines.append(f"📌 {date} — <b>{w} кг</b> (старт)")
+        else:
+            diff = round(w - float(logs[len(logs) - i]["weight"]), 1)
+            arrow = "📈" if diff > 0 else "📉"
+            sign = "+" if diff > 0 else ""
+            lines.append(f"{arrow} {date} — <b>{w} кг</b> ({sign}{diff} кг)")
+
+    first_w = logs[-1]["weight"]
+    last_w  = logs[0]["weight"]
+    total   = round(last_w - first_w, 1)
+    total_sign = "+" if total > 0 else ""
+    total_emoji = "📈" if total > 0 else ("📉" if total < 0 else "➡️")
+
+    text = (
+        "📊 <b>Твой прогресс по весу</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n".join(lines) +
+        "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{total_emoji} Итого: <b>{total_sign}{total} кг</b>"
+    )
+
+    await call.message.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Записать вес сейчас", callback_data="log_weight")],
+            [InlineKeyboardButton(text="🔄 Пересчитать КБЖУ",   callback_data="restart")],
+        ]),
+    )
+
+
+# /myid — узнать свой Telegram ID
+@dp.message(Command("myid"))
+async def cmd_myid(msg: Message) -> None:
+    await msg.answer(f"🆔 Твой Telegram ID: <code>{msg.from_user.id}</code>", parse_mode=ParseMode.HTML)
+
+
+# /stats — только для владельца
+@dp.message(Command("stats"))
+async def cmd_stats(msg: Message) -> None:
+    if OWNER_ID and msg.from_user.id != OWNER_ID:
+        return
+    s = get_coaching_stats()
+    conversion = (
+        round(s["unique_clickers"] / s["total_users"] * 100, 1)
+        if s["total_users"] else 0
+    )
+    await msg.answer(
+        "📊 <b>Статистика бота</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Всего пользователей: <b>{s['total_users']}</b>\n"
+        f"🆕 Новых за 7 дней: <b>{s['new_users_7d']}</b>\n\n"
+        "🤝 <b>Клики «Работа со мной»:</b>\n"
+        f"  • За 7 дней: <b>{s['clicks_7d']}</b>\n"
+        f"  • За 30 дней: <b>{s['clicks_30d']}</b>\n"
+        f"  • Всего кликов: <b>{s['total_clicks']}</b>\n"
+        f"  • Уникальных: <b>{s['unique_clickers']}</b>\n\n"
+        f"📈 Конверсия: <b>{conversion}%</b> пользователей перешли к разделу коучинга",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -663,13 +886,14 @@ async def cmd_help(msg: Message) -> None:
     await msg.answer(
         "🤖 <b>NutritionBot — команды:</b>\n\n"
         "/start — 🚀 Новый расчёт КБЖУ\n"
-        "/profile — 👤 Мой профиль и результаты\n"
+        "/profile — 👤 Мой профиль и прогресс\n"
+        "/weight — 📊 Записать текущий вес\n"
         "/help — ❓ Помощь\n\n"
         "<b>Что умеет бот:</b>\n"
         "• Расчёт нормы калорий, белков, жиров, углеводов\n"
         "• Формула Харриса-Бенедикта с учётом активности\n"
         "• Пример меню под твою цель\n"
-        "• Советы по применению КБЖУ в жизни",
+        "• Трекинг веса и динамика прогресса",
         parse_mode=ParseMode.HTML,
     )
 
@@ -693,6 +917,17 @@ async def main() -> None:
     # Сбрасываем webhook и выбиваем любые конкурирующие соединения
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("🔌 Старые соединения разорваны, webhook сброшен")
+
+    # Меню команд в Telegram
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start",   description="🚀 Новый расчёт КБЖУ"),
+        BotCommand(command="profile", description="👤 Мой профиль и прогресс"),
+        BotCommand(command="weight",  description="📊 Записать текущий вес"),
+        BotCommand(command="stats",   description="📈 Статистика (для владельца)"),
+        BotCommand(command="help",    description="❓ Помощь"),
+    ])
+    log.info("📋 Меню команд установлено")
 
     log.info("✅ Bot started")
     try:
